@@ -1,0 +1,7 @@
+[package]
+name = "ternary-semaphore"
+version = "0.1.0"
+edition = "2021"
+description = "Ternary semaphore for GPU resource control. Permits tracked as {-1=overcommitted, 0=at_capacity, +1=available}. Auto-scaling and priority queue."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/ternary-semaphore"
