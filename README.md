@@ -1,74 +1,153 @@
 # ternary-semaphore
 
-Ternary semaphore for GPU resource concurrency control.
+Ternary semaphore for **GPU resource control** with three-state capacity tracking: `+1` (available), `0` (at capacity), and `-1` (overcommitted). Provides priority-queued acquisition, auto-admission on release, and utilization metrics.
 
-## Why This Exists
+## Why It Matters
 
-A standard semaphore tells you "has capacity" or "full." But in GPU scheduling, there's a third state that matters: **overcommitted** — more permits issued than slots, because a high-priority kernel forced its way in. Knowing whether you're at capacity vs. overcommitted drives different scheduling decisions. At capacity means queue the next kernel. Overcommitted means drain before accepting anything new.
+Binary semaphores (locked/unlocked) can't distinguish "all permits in use" from "system overloaded." Ternary semaphores add an explicit **overcommitted** state, enabling:
 
-This crate implements a counting semaphore with priority queuing, force-acquire for emergencies, and a ternary state signal: `Available (+1)`, `AtCapacity (0)`, `Overcommitted (-1)`.
+| State | Value | Meaning | Action |
+|-------|-------|---------|--------|
+| Available | `+1` | `active < max` | Grant immediately |
+| AtCapacity | `0` | `active == max` | Queue request |
+| Overcommitted | `-1` | `active > max` | Alert, reject, or backpressure |
 
-## Architecture
+The `force_acquire` path allows controlled overcommit for priority workloads (e.g., kernel launches that must execute), while the priority queue ensures high-priority kernels get admitted first when permits free up.
 
-### Core Types
+## How It Works
 
-- **`PermitState`** — Ternary: `Available (+1)`, `AtCapacity (0)`, `Overcommitted (-1)`.
-- **`Permit`** — An acquired permit with `id`, `kernel` name, and `priority` (ternary).
-- **`TernarySemaphore`** — Tracks `max_permits`, active count, and a priority wait queue.
+### State Transitions
 
-### Key Behaviors
+```
+                  acquire (active < max)
+   Available ─────────────────────────→ AtCapacity
+   (+1)                                  (0)
+       ↑                                    │
+       └── release (active < max) ──────────┘
+                           │
+           force_acquire   │   force_acquire
+       (active == max) ────┼────→ Overcommitted
+                           │        (-1)
+                           │
+                      release
+```
 
-- **try_acquire**: If capacity exists, issue a permit. Otherwise, queue by priority.
-- **force_acquire**: Bypass capacity — emergency kernel gets a permit even if overcommitted.
-- **release**: Return a permit. If queued kernels exist, dequeue the highest priority.
-- **drain_queue**: Flush all waiting kernels (e.g., during shutdown).
+### Acquisition Protocol
 
-## Usage
+**`try_acquire(kernel, priority)`:**
+
+```
+if active < max_permits:
+    active += 1
+    return Some(permit_id)
+else:
+    enqueue(permit with priority)
+    return None
+```
+
+**`force_acquire(kernel)`:**
+
+```
+active += 1   // no check — overcommit allowed
+return permit_id
+```
+
+**`release()`:**
+
+```
+active -= 1
+if active < max_permits and queue not empty:
+    dequeue highest priority → auto-admit
+    return Some(admitted_permit)
+return None
+```
+
+### Priority Queue Admission
+
+`drain_queue()` admits waiting permits in priority order until capacity is full:
+
+```
+while active < max_permits and queue not empty:
+    find max-priority permit in queue
+    admit it
+```
+
+Finding the max-priority permit is O(Q) per admission (linear scan). Total: O(Q²) worst case for full drain. This is acceptable for moderate queue sizes; for very large queues, a `BinaryHeap` would reduce to O(Q log Q).
+
+**Complexity:**
+- `try_acquire`: O(1)
+- `force_acquire`: O(1)
+- `release`: O(Q) (priority dequeue)
+- `drain_queue`: O(Q²) worst case
+
+### Utilization
+
+```
+utilization = active / max_permits
+```
+
+At `utilization = 1.0`, the semaphore is AtCapacity. Above 1.0, it's Overcommitted.
+
+## Quick Start
 
 ```rust
 use ternary_semaphore::{TernarySemaphore, PermitState};
 
-let mut sem = TernarySemaphore::new(4); // 4 GPU slots
+let mut sem = TernarySemaphore::new(4);
 
-let p1 = sem.try_acquire("matmul", 1).unwrap();   // priority +1
-let p2 = sem.try_acquire("conv2d", 0).unwrap();   // priority 0
 assert_eq!(sem.state(), PermitState::Available);
 
+let id = sem.try_acquire("matmul", priority: 0);
+assert!(id.is_some());
+assert_eq!(sem.active_count(), 1);
+
 // Fill to capacity
-let p3 = sem.try_acquire("layernorm", 1).unwrap();
-let p4 = sem.try_acquire("softmax", -1).unwrap();
+for _ in 0..3 { sem.force_acquire("conv"); }
 assert_eq!(sem.state(), PermitState::AtCapacity);
 
-// Emergency bypass
-let p5 = sem.force_acquire("critical_kernel");
-assert_eq!(sem.state(), PermitState::Overcommitted);
-
-// Release
-sem.release();
-assert_eq!(sem.utilization(), 1.0); // still at max
+// Release auto-admits from queue
+sem.try_acquire("queued_kernel", 1);  // gets queued
+let next = sem.release();
+assert!(next.is_some()); // auto-admitted high-priority waiter
 ```
 
-## API Reference
+## API
+
+### `TernarySemaphore`
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `new(max_permits)` | `TernarySemaphore` | Create with N slots |
-| `state()` | `PermitState` | Current ternary state |
-| `try_acquire(kernel, priority)` | `Option<u64>` | Get permit if available, else queue |
-| `force_acquire(kernel)` | `u64` | Emergency: always succeeds |
-| `release()` | `Option<Permit>` | Release and maybe dequeue |
-| `drain_queue()` | `Vec<Permit>` | Flush all waiting kernels |
-| `active_count()` | `usize` | Currently active permits |
-| `waiting_count()` | `usize` | Queued kernels |
-| `utilization()` | `f64` | active / max ratio |
-| `issued()` | `u64` | Total permits ever issued |
+| `new(max_permits)` | `Self` | Initialize with capacity |
+| `state()` | `PermitState` | Current: Available / AtCapacity / Overcommitted |
+| `try_acquire(kernel, priority)` | `Option<u64>` | Acquire if available, else queue |
+| `force_acquire(kernel)` | `u64` | Acquire unconditionally (may overcommit) |
+| `release()` | `Option<Permit>` | Free a permit; auto-admit next from queue |
+| `drain_queue()` | `Vec<Permit>` | Admit all possible queued permits |
+| `active_count()` | `usize` | Currently held permits |
+| `waiting_count()` | `usize` | Queued requests |
+| `utilization()` | `f64` | active / max_permits |
 
-## The Deeper Idea
+### `Permit`
 
-Force-acquire is the GPU scheduling equivalent of **interrupt priority inversion rescue**. When a high-priority kernel (e.g., real-time inference) arrives and all slots are taken by low-priority batch jobs, you have two choices: wait (latency spike) or evict (complexity). Force-acquire takes a third path: issue the permit anyway, accept temporary overcommitment, and let the next release naturally correct. The ternary state tells downstream systems "we're in emergency mode" without requiring a full scheduling overhaul.
+```rust
+pub struct Permit {
+    pub id: u64,
+    pub kernel: String,
+    pub priority: i8,  // -1, 0, +1
+}
+```
 
-## Related Crates
+## Architecture Notes
 
-- **ternary-lease** — distributed leases with ternary states
-- **ternary-backpressure** — backpressure signals for pipeline stages
-- **ternary-rate-limiter** — rate limiting with ternary feedback
+The **γ + η = C** invariant: *generation* (γ) is the permit acquisition process (new work entering the system), *entropy* (η) is the queue depth diversity (how many distinct priority levels are waiting), and *conservation* (C) is the invariant `active ≤ max_permits` under normal operation. The `force_acquire` path deliberately violates C for priority override, entering the `Overcommitted (-1)` state — this is the entropy-overflow valve that prevents deadlock while signaling the violation through the ternary state.
+
+## References
+
+- **Counting semaphores:** Dijkstra, E. W. "Cooperating Sequential Processes" (1965)
+- **Priority inversion:** Sha, L., Rajkumar, R. & Lehoczky, J. "Priority Inheritance Protocols" (1990)
+- **GPU resource management:** NVIDIA, "CUDA C++ Programming Guide" §7 (occupancy)
+- **Overcommit strategies:** Govindan, S. et al. "Cuanta: Quantifying Effects of Scheduler" (2011)
+
+## License
+
+MIT
